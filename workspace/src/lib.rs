@@ -4,6 +4,7 @@ mod ffi;
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -47,10 +48,15 @@ struct Values {
     heap: BinaryHeap<Entry>,
 }
 
+struct ProducerHeap {
+    values: Mutex<Values>,
+}
+
 struct QueueState {
     capacity: usize,
     max_value_size: usize,
-    values: Mutex<Values>,
+    reserved: AtomicUsize,
+    producers: Vec<ProducerHeap>,
 }
 
 pub struct Queue {
@@ -71,19 +77,28 @@ impl Queue {
         }
         let capacity = usize::try_from(capacity).map_err(|_| STATUS_INVALID)?;
         let max_value_size = usize::try_from(max_value_size).map_err(|_| STATUS_INVALID)?;
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve_exact(capacity)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        let mut producers = Vec::with_capacity(producer_count as usize);
+        for _ in 0..producer_count {
+            let mut heap = BinaryHeap::new();
+            // Keep the common one-item push allocation-free without reserving
+            // the whole queue once per producer.
+            heap.try_reserve(1)
+                .map_err(|_| STATUS_INTERNAL_ERROR)?;
+            producers.push(ProducerHeap {
+                values: Mutex::new(Values {
+                    next_sequence: 0,
+                    heap,
+                }),
+            });
+        }
         Ok(Self {
             producer_count,
             consumer_count,
             state: Arc::new(QueueState {
                 capacity,
                 max_value_size,
-                values: Mutex::new(Values {
-                    next_sequence: 0,
-                    heap,
-                }),
+                reserved: AtomicUsize::new(0),
+                producers,
             }),
         })
     }
@@ -92,6 +107,7 @@ impl Queue {
         (id < self.producer_count)
             .then(|| Producer {
                 state: Arc::clone(&self.state),
+                producer_id: id as usize,
             })
             .ok_or(STATUS_INVALID)
     }
@@ -107,6 +123,7 @@ impl Queue {
 
 pub struct Producer {
     state: Arc<QueueState>,
+    producer_id: usize,
 }
 
 impl Producer {
@@ -114,17 +131,43 @@ impl Producer {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
         }
-        let Ok(mut values) = self.state.values.lock() else {
-            return STATUS_INTERNAL_ERROR;
-        };
-        if values.heap.len() == self.state.capacity {
-            return STATUS_FULL;
+
+        // Reservation is the capacity linearization point. It remains held
+        // while the value is copied and until publication into this producer's
+        // heap, so FULL includes in-flight MPMC enqueues.
+        let mut reserved = self.state.reserved.load(AtomicOrdering::Acquire);
+        loop {
+            if reserved >= self.state.capacity {
+                return STATUS_FULL;
+            }
+            match self.state.reserved.compare_exchange_weak(
+                reserved,
+                reserved + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => reserved = observed,
+            }
         }
+
         let mut value = Vec::new();
         if value.try_reserve_exact(data.len()).is_err() {
+            self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
         }
         value.extend_from_slice(data);
+
+        let producer = &self.state.producers[self.producer_id];
+        let Ok(mut values) = producer.values.lock() else {
+            self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+            return STATUS_INTERNAL_ERROR;
+        };
+        if values.heap.try_reserve(1).is_err() {
+            drop(values);
+            self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+            return STATUS_INTERNAL_ERROR;
+        }
         let sequence = values.next_sequence;
         values.next_sequence = values.next_sequence.wrapping_add(1);
         values.heap.push(Entry {
@@ -132,6 +175,8 @@ impl Producer {
             sequence,
             value,
         });
+        // The heap lock release publishes the entry to consumers. The
+        // reservation remains counted until a consumer removes the entry.
         STATUS_OK
     }
 }
@@ -142,19 +187,51 @@ pub struct Consumer {
 
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
-        let Ok(mut values) = self.state.values.lock() else {
-            return Err(STATUS_INTERNAL_ERROR);
-        };
-        let Some(entry) = values.heap.peek() else {
-            return Err(STATUS_EMPTY);
-        };
-        if entry.value.len() > output.len() {
-            return Err(STATUS_INVALID);
+        loop {
+            // Inspect each producer heap independently. A producer can only
+            // publish while holding its own heap lock, and a later
+            // revalidation handles another consumer winning the candidate.
+            let mut best: Option<(usize, u64, u64)> = None;
+            for (index, producer) in self.state.producers.iter().enumerate() {
+                let Ok(values) = producer.values.lock() else {
+                    return Err(STATUS_INTERNAL_ERROR);
+                };
+                if let Some(entry) = values.heap.peek() {
+                    let candidate = (index, entry.priority, entry.sequence);
+                    let is_better = match best.as_ref() {
+                        None => true,
+                        Some(current) => {
+                            (entry.priority, entry.sequence) < (current.1, current.2)
+                        }
+                    };
+                    if is_better {
+                        best = Some(candidate);
+                    }
+                }
+            }
+
+            let Some((index, priority, sequence)) = best else {
+                return Err(STATUS_EMPTY);
+            };
+            let producer = &self.state.producers[index];
+            let Ok(mut values) = producer.values.lock() else {
+                return Err(STATUS_INTERNAL_ERROR);
+            };
+            let Some(entry) = values.heap.peek() else {
+                continue;
+            };
+            if entry.priority != priority || entry.sequence != sequence {
+                continue;
+            }
+            if entry.value.len() > output.len() {
+                return Err(STATUS_INVALID);
+            }
+            output[..entry.value.len()].copy_from_slice(&entry.value);
+            let length = entry.value.len();
+            values.heap.pop();
+            self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+            return Ok(length);
         }
-        output[..entry.value.len()].copy_from_slice(&entry.value);
-        let length = entry.value.len();
-        values.heap.pop();
-        Ok(length)
     }
 }
 

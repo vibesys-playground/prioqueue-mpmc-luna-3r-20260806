@@ -1,0 +1,30 @@
+# Progress
+
+## Round 1 plan
+
+- Active Major: M1, remove the single queue mutex from MPMC enqueue.
+- Task: Replace the shared `BinaryHeap`/`Mutex` hot path in `src/lib.rs` with producer-owned priority heaps, an atomic reservation count for capacity, and a consumer-side selection mechanism that returns the lowest numeric priority among published items. Preserve the copying ABI in `src/ffi.rs` and all required status semantics.
+- Pass criteria: The candidate builds as `./priority-queue-candidate.so`; the evaluator accuracy checker passes for all supported scenarios and value lengths; MPMC dequeue returns only published values in minimum-priority order and every successful enqueue is returned exactly once; the benchmark sanity run completes and reports end-to-end `total_ops_per_sec` without hangs or malformed statuses.
+- Rationale: The current implementation holds one mutex while copying values and manipulating one heap, forcing all MPMC producers and consumers through the same serialized critical section. Producer-local heaps should allow concurrent enqueues while retaining a bounded, reservation-aware queue.
+## Round 1 — Orchestrator (plan)
+- **reasoning**: The baseline serializes every enqueue and dequeue behind one mutex, making producer contention the clearest structural bottleneck. Producer-local heaps with atomic capacity reservation should allow concurrent publication while retaining correct global priority selection.
+
+### Task
+Implement Major M1 in src/lib.rs: replace the single shared BinaryHeap/Mutex hot path with producer-owned priority heaps, atomic reservation accounting for bounded capacity, and a consumer selection path that safely returns the lowest-priority published item across all producer heaps. Preserve the existing copying ABI and status semantics in src/ffi.rs, including reservation-aware MPMC FULL/EMPTY behavior and exact value conservation.
+
+### Pass criteria
+Builds ./priority-queue-candidate.so. The full accuracy checker passes for all scenarios and tested value lengths. MPMC operations remain linearizable under the reservation-aware model: dequeue returns only published values at the lowest available priority, and every successful enqueue is returned exactly once. The end-to-end benchmark sanity run completes without hangs or malformed statuses and reports total_ops_per_sec.
+
+## Round 1 — Implementer result
+
+- Replaced the queue-wide values mutex with one mutex-protected `BinaryHeap` per producer handle.
+- Added atomic reservation accounting: enqueue reserves bounded capacity before copying/publishing, and dequeue releases the reservation only after removing a published item.
+- Added consumer-side minimum selection across producer heaps with candidate revalidation to handle concurrent consumers safely; copying ABI and status behavior remain in `src/ffi.rs`.
+- `cargo test --release --locked` passes and `make priority-queue-candidate.so` produces the required shared library with all `vspq_*` symbols.
+- The Go accuracy/benchmark commands were not runnable in this environment because the Go toolchain reports `cannot find GOROOT directory: 'go' binary is trimmed and GOROOT is not set`.
+## Round 1 — Implementer (attempt 1)
+- **expected_behavior**: MPMC enqueue returns FULL when reservations reach capacity; dequeue returns only published values in lowest-priority order, preserves copying/status semantics, and conserves every successful value exactly once.
+
+### Summary
+Implemented producer-owned priority heaps, atomic reservation-based capacity accounting, and revalidated consumer minimum selection. Built the required shared library; Rust tests pass. Go evaluator was unavailable due to missing GOROOT.
+
