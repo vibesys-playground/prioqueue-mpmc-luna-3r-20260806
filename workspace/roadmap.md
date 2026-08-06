@@ -68,8 +68,8 @@ acceptance"); read it before parking or abandoning.
 
 ## Major
 
-- [done] M1: Remove the single queue mutex from MPMC enqueue — completed round 1. Producer-owned heaps, atomic reservations, and consumer-side minimum selection passed the full correctness gate and benchmark sanity (727,512 end-to-end ops/s); no profiler was available, but the structural change is implemented and verified.
-- [in_progress] M2: Reduce copied-value allocation and reclamation overhead — round 1. Reuse bounded storage associated with queue slots or a safe pool so measured enqueue/dequeue operations do not allocate on every successful enqueue.
+- [in_progress] M1: Remove the single queue mutex from MPMC enqueue — round 1. Give each producer an owned priority heap, use an atomic reservation count for the bounded capacity, and let consumers select the minimum published item across producer heaps. This should reduce producer-producer lock contention while preserving the reservation-aware MPMC contract.
+- [todo] M2: Reduce copied-value allocation and reclamation overhead. Reuse bounded storage associated with queue slots or a safe pool so measured enqueue/dequeue operations do not allocate on every successful enqueue.
 - [todo] M3: Add topology-specialized fast paths. Exploit the exact handle counts for SPSC/MPSC/SPMC where stronger ownership permits cheaper synchronization, without changing the generic MPMC behavior.
 - [todo] M4: Tune memory layout and atomic/locking behavior using end-to-end benchmark results. Address cache-line contention, scan costs, and priority-selection overhead after correctness is stable.
 
