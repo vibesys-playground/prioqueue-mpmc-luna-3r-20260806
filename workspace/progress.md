@@ -79,3 +79,35 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 2 — Implementer result
+
+- Replaced per-enqueue `Vec<u8>` ownership and dynamically growing per-item heap nodes with a bounded reusable slot pool sized by queue capacity. Producer heaps are pre-reserved to capacity and store slot metadata; slot byte buffers grow only as needed up to the trusted maximum and are reused after dequeue.
+- Enqueue reserves capacity before taking a slot, copies under slot ownership, and returns the slot plus reservation on lock or allocation failure. FULL and INVALID paths retain their required semantics; undersized dequeue output leaves the slot queued and caller output unchanged.
+- `cargo test --release --locked` passes and `make priority-queue-candidate.so` rebuilds the required shared library.
+- Native ABI probe passes for 4 producers/4 consumers with zero, non-word-aligned, and maximum-length values, input overwrite, concurrent undersized dequeue retention, and exact value conservation. Native MPMC benchmark completes without hangs or malformed statuses and reports 691172.790268 successful ops/s in a 1-second run.
+- The Go accuracy checker could not run because the environment's trimmed `go` binary reports `cannot find GOROOT directory`.
+
+## Round 2 — Orchestrator (pre-round)
+- **need_profile**: True
+- **profile_focus**: Profile the MPMC enqueue/dequeue hot paths, focusing on producer-heap lock contention, consumer O(P) heap scanning/revalidation, value-copy/allocation costs, and atomic reservation overhead.
+- **reasoning**: The current implementation passed correctness, but its throughput is limited by several competing structural costs and there is no recent profile to identify the dominant one. Measurement should determine whether to optimize consumer selection, locking, or copying/allocation first.
+
+## Round 2 — Orchestrator (plan)
+- **Active Major**: M2, reduce copied-value allocation and reclamation overhead.
+- **Task**: Replace per-successful-enqueue `Vec<u8>` allocation and per-item heap-node allocation in `src/lib.rs` with a bounded, reusable storage strategy compatible with variable value lengths up to the trusted maximum. Keep producer-local priority ordering and reservation semantics intact; failed/full/invalid operations must not consume or corrupt reusable storage.
+- **Pass criteria**: The candidate builds as `./priority-queue-candidate.so`; the full accuracy checker passes for SPSC, MPSC, SPMC, and MPMC, including zero/non-word-aligned/max-length values, input overwrite, undersized-output retention, and exact conservation. The benchmark sanity run completes without hangs or malformed statuses and reports end-to-end `total_ops_per_sec`; the implementation shows no correctness regressions and should reduce successful-operation allocation/reclamation overhead without introducing an unbounded memory strategy.
+- **Reasoning**: Round 1 removed the queue-wide mutex and passed at 727,512 end-to-end MPMC ops/s. The remaining hot path visibly allocates a value buffer and grows the heap for every successful enqueue, while dequeue drops both; bounded reusable storage directly targets this measured operation cost and is the next structural lever before topology-specific tuning.
+## Round 2 — Orchestrator (plan)
+- **reasoning**: M1 passed correctness and benchmark sanity at 727,512 end-to-end MPMC ops/s. The remaining enqueue path visibly allocates a value buffer and heap storage per successful item, so bounded reuse is the next direct structural target for throughput improvement.
+
+### Task
+Implement Major M2 in src/lib.rs: replace per-successful-enqueue Vec<u8> allocation and per-item heap-node allocation with bounded reusable storage compatible with variable value lengths up to the trusted maximum. Preserve producer-local priority ordering, reservation-aware capacity semantics, copying ABI behavior, and safe cleanup on FULL, INVALID, or allocation failure paths.
+
+### Pass criteria
+Builds ./priority-queue-candidate.so. Full accuracy passes for SPSC, MPSC, SPMC, and MPMC, including zero/non-word-aligned/max-length values, input overwrite, undersized-output retention, and exact value conservation. Benchmark sanity completes without hangs or malformed statuses and reports end-to-end total_ops_per_sec. Reusable storage remains bounded by configured capacity and maximum value size, with no correctness regressions.
+## Round 2 — Implementer (attempt 1)
+- **expected_behavior**: The library preserves priority ordering, reservation-aware FULL/EMPTY semantics, copying ABI behavior, undersized-output retention, exact value conservation, and safely reclaims slots on failure paths. Native benchmark reports end-to-end total_ops_per_sec.
+
+### Summary
+Implemented bounded reusable queue slots and pre-reserved producer heap storage in src/lib.rs, eliminating per-enqueue value/node allocations after warmup. Build, Rust tests, native ABI probe, and benchmark pass; results appended to progress.md.
+

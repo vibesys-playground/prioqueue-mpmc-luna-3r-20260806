@@ -17,7 +17,7 @@ const STATUS_INTERNAL_ERROR: u32 = 4;
 struct Entry {
     priority: u64,
     sequence: u64,
-    value: Vec<u8>,
+    slot: usize,
 }
 
 impl PartialEq for Entry {
@@ -52,11 +52,18 @@ struct ProducerHeap {
     values: Mutex<Values>,
 }
 
+struct Slot {
+    value: Vec<u8>,
+    length: usize,
+}
+
 struct QueueState {
     capacity: usize,
     max_value_size: usize,
     reserved: AtomicUsize,
     producers: Vec<ProducerHeap>,
+    slots: Vec<Mutex<Slot>>,
+    free_slots: Mutex<Vec<usize>>,
 }
 
 pub struct Queue {
@@ -77,12 +84,13 @@ impl Queue {
         }
         let capacity = usize::try_from(capacity).map_err(|_| STATUS_INVALID)?;
         let max_value_size = usize::try_from(max_value_size).map_err(|_| STATUS_INVALID)?;
-        let mut producers = Vec::with_capacity(producer_count as usize);
+        let producer_count_usize = producer_count as usize;
+        let mut producers = Vec::with_capacity(producer_count_usize);
         for _ in 0..producer_count {
             let mut heap = BinaryHeap::new();
-            // Keep the common one-item push allocation-free without reserving
-            // the whole queue once per producer.
-            heap.try_reserve(1)
+            // Heap nodes are bounded storage too. Reserving up front avoids
+            // reallocations as items are published into a producer heap.
+            heap.try_reserve_exact(capacity)
                 .map_err(|_| STATUS_INTERNAL_ERROR)?;
             producers.push(ProducerHeap {
                 values: Mutex::new(Values {
@@ -90,6 +98,21 @@ impl Queue {
                     heap,
                 }),
             });
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        let mut free_slots = Vec::new();
+        free_slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for index in 0..capacity {
+            slots.push(Mutex::new(Slot {
+                value: Vec::new(),
+                length: 0,
+            }));
+            free_slots.push(index);
         }
         Ok(Self {
             producer_count,
@@ -99,6 +122,8 @@ impl Queue {
                 max_value_size,
                 reserved: AtomicUsize::new(0),
                 producers,
+                slots,
+                free_slots: Mutex::new(free_slots),
             }),
         })
     }
@@ -151,29 +176,59 @@ impl Producer {
             }
         }
 
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
-            self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
-            return STATUS_INTERNAL_ERROR;
-        }
-        value.extend_from_slice(data);
-
         let producer = &self.state.producers[self.producer_id];
         let Ok(mut values) = producer.values.lock() else {
             self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
         };
-        if values.heap.try_reserve(1).is_err() {
+        let slot_index = {
+            let Ok(mut free_slots) = self.state.free_slots.lock() else {
+                drop(values);
+                self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+                return STATUS_INTERNAL_ERROR;
+            };
+            let Some(slot_index) = free_slots.pop() else {
+                drop(free_slots);
+                drop(values);
+                self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+                return STATUS_INTERNAL_ERROR;
+            };
+            slot_index
+        };
+        let slot = &self.state.slots[slot_index];
+        let Ok(mut slot) = slot.lock() else {
+            if let Ok(mut free_slots) = self.state.free_slots.lock() {
+                free_slots.push(slot_index);
+            }
             drop(values);
             self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
             return STATUS_INTERNAL_ERROR;
+        };
+        if slot.value.len() < data.len() {
+            let missing = data.len() - slot.value.len();
+            if slot.value.try_reserve_exact(missing).is_err() {
+                slot.length = 0;
+                drop(slot);
+                if let Ok(mut free_slots) = self.state.free_slots.lock() {
+                    free_slots.push(slot_index);
+                }
+                drop(values);
+                self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
+                return STATUS_INTERNAL_ERROR;
+            }
         }
+        if slot.value.len() < data.len() {
+            slot.value.resize(data.len(), 0);
+        }
+        slot.value[..data.len()].copy_from_slice(data);
+        slot.length = data.len();
+        drop(slot);
         let sequence = values.next_sequence;
         values.next_sequence = values.next_sequence.wrapping_add(1);
         values.heap.push(Entry {
             priority,
             sequence,
-            value,
+            slot: slot_index,
         });
         // The heap lock release publishes the entry to consumers. The
         // reservation remains counted until a consumer removes the entry.
@@ -223,12 +278,23 @@ impl Consumer {
             if entry.priority != priority || entry.sequence != sequence {
                 continue;
             }
-            if entry.value.len() > output.len() {
+            let slot_index = entry.slot;
+            let slot = &self.state.slots[slot_index];
+            let Ok(slot) = slot.lock() else {
+                return Err(STATUS_INTERNAL_ERROR);
+            };
+            if slot.length > output.len() {
                 return Err(STATUS_INVALID);
             }
-            output[..entry.value.len()].copy_from_slice(&entry.value);
-            let length = entry.value.len();
+            output[..slot.length].copy_from_slice(&slot.value[..slot.length]);
+            let length = slot.length;
             values.heap.pop();
+            drop(slot);
+            if let Ok(mut free_slots) = self.state.free_slots.lock() {
+                free_slots.push(slot_index);
+            } else {
+                return Err(STATUS_INTERNAL_ERROR);
+            }
             self.state.reserved.fetch_sub(1, AtomicOrdering::Release);
             return Ok(length);
         }
