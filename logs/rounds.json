@@ -1,0 +1,26 @@
+[
+  {
+    "round": 1,
+    "commit": "192ac3d76124d903202531c64e340b4dd1308c88",
+    "perf_metric": 727512.314659,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 2,
+    "commit": "65996d5af1e4b153fe7f31a4ef9aaf54592fdc95",
+    "perf_metric": 581311.073847,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 3,
+    "commit": "4def29baa068a3465c8a52781debc33833e108e4",
+    "perf_metric": 799848.125189,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  }
+]
